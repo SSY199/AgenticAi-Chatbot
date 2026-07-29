@@ -1,0 +1,57 @@
+# Virtual Environment
+myenv/
+venv/
+env/
+.venv/
+
+# Environment Variables
+.env
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Python Distribution
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Type Checker
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Ruff
+.ruff_cache/
+
+# Pyright/Pylance
+.pyright/
+
+# IDEs
+.idea/
+
+# Temporary Files
+*.tmp
+*.temp
