@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import tempfile
+import time
 from typing import Annotated, Any, Dict, Optional, TypedDict
 
 from dotenv import load_dotenv
@@ -38,27 +40,93 @@ embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 
 # -------------------
-# 2. PDF retriever store (per thread)
+# 2. SQLite Database & Storage Setup
 # -------------------
-_THREAD_RETRIEVERS: Dict[str, Any] = {}
-_THREAD_METADATA: Dict[str, dict] = {}
+DB_PATH = "chatbot.db"
+VECTOR_STORE_DIR = "./faiss_stores"
+os.makedirs(VECTOR_STORE_DIR, exist_ok=True)
+
+# Guard limits to prevent memory exhaustion and DoS
+MAX_FILES_PER_THREAD = 3
+MAX_PAGES_PER_FILE = 100
+MAX_CHUNKS_PER_THREAD = 5000
+TTL_SECONDS = 86400  # 24 Hours time-to-live
+
+# Establish Connection and initialize document structure table
+conn = sqlite3.connect(database=DB_PATH, check_same_thread=False)
+
+with conn:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS document_metadata (
+            thread_id TEXT PRIMARY KEY,
+            filename TEXT,
+            documents_count INTEGER,
+            chunks_count INTEGER,
+            updated_at REAL
+        )
+    """)
+
+
+def cleanup_expired_threads():
+    """Deletes physical FAISS assets and DB meta records older than the TTL limit."""
+    cutoff_time = time.time() - TTL_SECONDS
+    cursor = conn.cursor()
+    cursor.execute("SELECT thread_id FROM document_metadata WHERE updated_at < ?", (cutoff_time,))
+    expired_threads = cursor.fetchall()
+    
+    for (expired_id,) in expired_threads:
+        thread_dir = os.path.join(VECTOR_STORE_DIR, expired_id)
+        if os.path.exists(thread_dir):
+            shutil.rmtree(thread_dir)
+        
+        cursor.execute("DELETE FROM document_metadata WHERE thread_id = ?", (expired_id,))
+    conn.commit()
 
 
 def _get_retriever(thread_id: Optional[str]):
-    """Fetch the retriever for a thread if available."""
-    if thread_id and thread_id in _THREAD_RETRIEVERS:
-        return _THREAD_RETRIEVERS[thread_id]
+    """Lazy loads the FAISS index from disk when needed and updates its TTL."""
+    if not thread_id:
+        return None
+        
+    # Check for memory leaks before parsing indices
+    cleanup_expired_threads()
+    
+    thread_dir = os.path.join(VECTOR_STORE_DIR, str(thread_id))
+    if os.path.exists(thread_dir):
+        try:
+            # Refresh timestamp to reset TTL countdown on active usage
+            with conn:
+                conn.execute(
+                    "UPDATE document_metadata SET updated_at = ? WHERE thread_id = ?",
+                    (time.time(), str(thread_id))
+                )
+            
+            vector_store = FAISS.load_local(
+                thread_dir, 
+                embeddings, 
+                allow_dangerous_deserialization=True
+            )
+            return vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+        except Exception:
+            return None
     return None
 
 
 def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None) -> dict:
     """
-    Build a FAISS retriever for the uploaded PDF and store it for the thread.
-
-    Returns a summary dict that can be surfaced in the UI.
+    Builds a disk-persisted FAISS retriever for the uploaded PDF constrained by strict limits.
     """
     if not file_bytes:
         raise ValueError("No bytes received for ingestion.")
+        
+    thread_id_str = str(thread_id)
+    cleanup_expired_threads()
+
+    # Enforce file limit checkpoint per thread
+    cursor = conn.cursor()
+    cursor.execute("SELECT count(*) FROM document_metadata WHERE thread_id = ?", (thread_id_str,))
+    if cursor.fetchone()[0] >= MAX_FILES_PER_THREAD:
+        raise ValueError(f"Upload limit reached. Maximum {MAX_FILES_PER_THREAD} documents allowed per thread.")
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
         temp_file.write(file_bytes)
@@ -67,31 +135,42 @@ def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None
     try:
         loader = PyPDFLoader(temp_path)
         docs = loader.load()
+        
+        # Enforce page limit safety checkpoint
+        if len(docs) > MAX_PAGES_PER_FILE:
+            raise ValueError(f"PDF length exceeds safety constraints. Maximum {MAX_PAGES_PER_FILE} pages allowed.")
 
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
         )
         chunks = splitter.split_documents(docs)
+        
+        # Enforce total chunk safety constraint
+        if len(chunks) > MAX_CHUNKS_PER_THREAD:
+            raise ValueError(f"Document complexity too high. Total chunks exceed limit of {MAX_CHUNKS_PER_THREAD}.")
 
+        # Persist index assets safely to a disk folder named after the target thread ID
+        thread_dir = os.path.join(VECTOR_STORE_DIR, thread_id_str)
         vector_store = FAISS.from_documents(chunks, embeddings)
-        retriever = vector_store.as_retriever(
-            search_type="similarity", search_kwargs={"k": 4}
-        )
+        vector_store.save_local(thread_dir)
 
-        _THREAD_RETRIEVERS[str(thread_id)] = retriever
-        _THREAD_METADATA[str(thread_id)] = {
-            "filename": filename or os.path.basename(temp_path),
-            "documents": len(docs),
-            "chunks": len(chunks),
-        }
+        resolved_name = filename or os.path.basename(temp_path)
+        
+        with conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO document_metadata (thread_id, filename, documents_count, chunks_count, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (thread_id_str, resolved_name, len(docs), len(chunks), time.time())
+            )
 
         return {
-            "filename": filename or os.path.basename(temp_path),
+            "filename": resolved_name,
             "documents": len(docs),
             "chunks": len(chunks),
         }
     finally:
-        # The FAISS store keeps copies of the text, so the temp file is safe to remove.
         try:
             os.remove(temp_path)
         except OSError:
@@ -176,7 +255,7 @@ def rag_tool(query: str, thread_id: Optional[str] = None) -> dict:
         "query": query,
         "context": context,
         "metadata": metadata,
-        "source_file": _THREAD_METADATA.get(str(thread_id), {}).get("filename"),
+        "source_file": thread_document_metadata(str(thread_id)).get("filename"),
     }
 
 
@@ -219,7 +298,6 @@ tool_node = ToolNode(tools)
 # -------------------
 # 6. Checkpointer
 # -------------------
-conn = sqlite3.connect(database="chatbot.db", check_same_thread=False)
 checkpointer = SqliteSaver(conn=conn)
 
 # -------------------
@@ -235,19 +313,43 @@ graph.add_edge("tools", "chat_node")
 
 chatbot = graph.compile(checkpointer=checkpointer)
 
-# -------------------
-# 8. Helpers
-# -------------------
 def retrieve_all_threads():
     all_threads = set()
+
     for checkpoint in checkpointer.list(None):
         all_threads.add(checkpoint.config["configurable"]["thread_id"])
+
     return list(all_threads)
 
 
 def thread_has_document(thread_id: str) -> bool:
-    return str(thread_id) in _THREAD_RETRIEVERS
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT 1 FROM document_metadata WHERE thread_id = ?",
+        (str(thread_id),),
+    )
+
+    return cursor.fetchone() is not None
 
 
 def thread_document_metadata(thread_id: str) -> dict:
-    return _THREAD_METADATA.get(str(thread_id), {})
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT filename, documents_count, chunks_count
+        FROM document_metadata
+        WHERE thread_id = ?
+        """,
+        (str(thread_id),),
+    )
+
+    row = cursor.fetchone()
+
+    if row:
+        return {
+            "filename": row[0],
+            "documents": row[1],
+            "chunks": row[2],
+        }
+
+    return {}
