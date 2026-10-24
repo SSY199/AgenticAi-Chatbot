@@ -1,0 +1,14 @@
+streamlit
+python-dotenv
+requests
+pypdf
+faiss-cpu
+sentence-transformers
+langchain-core
+langchain-community
+langchain-text-splitters
+langchain-google-genai
+langchain-huggingface
+langchain-tavily
+langgraph
+langgraph-checkpoint-sqlite
